@@ -17,6 +17,7 @@ use App\Services\SubscriptionService;
 use Carbon\CarbonImmutable;
 use DomainException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
 class FarmShopTest extends TestCase
@@ -28,6 +29,15 @@ class FarmShopTest extends TestCase
         'shipping_phone' => '0901234567',
         'shipping_address' => 'Đà Lạt, Lâm Đồng',
     ];
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        // No real maps lookups in tests: the geocoder finds nothing, so typed distances are used.
+        config(['services.maps.google_key' => null]);
+        Http::fake(['*' => Http::response([], 200)]);
+    }
 
     private function makeUser(string $role = 'customer'): User
     {
@@ -86,7 +96,7 @@ class FarmShopTest extends TestCase
         app(InventoryService::class)->allocateFefo($product, 1);
     }
 
-    public function test_customer_checks_out_from_cart_and_stock_is_deducted(): void
+    public function test_checkout_places_a_pending_order_and_sales_confirmation_takes_the_stock(): void
     {
         $admin = $this->makeUser('admin');
         $customer = $this->makeUser();
@@ -97,17 +107,30 @@ class FarmShopTest extends TestCase
             ->postJson('/api/cart', ['product_id' => $product->id, 'quantity' => 3])
             ->assertCreated();
 
-        $this->actingAs($customer, 'sanctum')
+        // The address cannot be geocoded in this test, so the typed distance (5 km) is used.
+        $code = $this->actingAs($customer, 'sanctum')
             ->postJson('/api/checkout', self::ADDRESS + ['payment_method' => 'cod', 'distance_km' => 5])
             ->assertCreated()
+            ->assertJsonPath('order.status', 'pending')
             ->assertJsonPath('order.subtotal', 150000)
             // Below the free-shipping threshold: 15,000 base + 2 extra km x 5,000.
             ->assertJsonPath('order.shipping_fee', 25000)
             ->assertJsonPath('order.total', 175000)
-            ->assertJsonPath('payment_url', null);
+            ->assertJsonPath('payment_url', null)
+            ->json('order.code');
+
+        // Placing the order checks stock but does not take it yet.
+        $this->assertSame(10, $batch->fresh()->quantity_on_hand);
+        $this->assertDatabaseCount('cart_items', 0);
+
+        $order = Order::where('code', $code)->firstOrFail();
+        $this->actingAs($this->makeUser('sales'), 'sanctum')
+            ->patchJson("/api/admin/orders/{$order->id}/status", ['status' => 'confirmed'])
+            ->assertOk()
+            ->assertJsonPath('status', 'confirmed')
+            ->assertJsonPath('items.0.batch_code', $batch->batch_code);
 
         $this->assertSame(7, $batch->fresh()->quantity_on_hand);
-        $this->assertDatabaseCount('cart_items', 0);
         $this->assertDatabaseHas('inventory_movements', [
             'product_batch_id' => $batch->id,
             'type' => 'sale',
@@ -146,10 +169,12 @@ class FarmShopTest extends TestCase
         $batch = $this->batchFor($product, 20, now()->addDays(10)->toDateString(), $admin);
         $service = app(OrderService::class);
 
-        // 500,000 VND order: 50 points earned on payment.
+        // 500,000 VND order: 50 points earned on payment, and the payment confirms it (stock taken).
         $first = $service->place($customer, [['product' => $product, 'quantity' => 5]], self::ADDRESS);
         $service->markPaid($first);
         $this->assertSame(50, $customer->fresh()->points_balance);
+        $this->assertSame(Order::STATUS_CONFIRMED, $first->fresh()->status);
+        $this->assertSame(15, $batch->fresh()->quantity_on_hand);
 
         // Spend 20 points (= 20,000 VND) on the next order.
         $second = $service->place($customer->fresh(), [['product' => $product, 'quantity' => 1]],
@@ -159,6 +184,8 @@ class FarmShopTest extends TestCase
         $this->assertSame(20000, $second->points_discount);
         $this->assertSame(95000, $second->total); // 100,000 + 15,000 shipping - 20,000 points
         $this->assertSame(30, $customer->fresh()->points_balance);
+
+        $service->confirm($second->fresh());
         $this->assertSame(14, $batch->fresh()->quantity_on_hand);
 
         $service->cancel($second->fresh());
@@ -170,41 +197,71 @@ class FarmShopTest extends TestCase
         $this->assertSame(3, PointTransaction::query()->where('user_id', $customer->id)->count());
     }
 
-    public function test_monthly_subscription_generates_orders_on_schedule(): void
+    public function test_prepaid_subscription_schedules_tuesdays_and_fridays_and_generates_confirmed_orders(): void
     {
         $admin = $this->makeUser('admin');
         $customer = $this->makeUser();
         $product = $this->makeProduct(40000, 'Rau xà lách');
-        $this->batchFor($product, 50, now()->addDays(30)->toDateString(), $admin);
+        $batch = $this->batchFor($product, 50, now()->addDays(30)->toDateString(), $admin);
 
         $plan = SubscriptionPlan::create(['name' => 'Gói rau tuần', 'discount_percent' => 10, 'is_active' => true]);
         SubscriptionPlanItem::create(['subscription_plan_id' => $plan->id, 'product_id' => $product->id, 'quantity' => 2]);
 
         $service = app(SubscriptionService::class);
-        $subscription = $service->subscribe($customer, $plan, [
-            'delivery_weekday' => 1,
-            ...self::ADDRESS,
-        ]);
+        $subscription = $service->subscribe($customer, $plan, ['delivery_days' => [2, 5], ...self::ADDRESS]);
 
-        // A monthly package is four weekly deliveries.
-        $this->assertSame(
-            $subscription->starts_on->addWeeks(3)->toDateString(),
-            $subscription->ends_on->toDateString(),
-        );
+        // 28 days always contain exactly 4 Tuesdays and 4 Fridays.
+        $this->assertCount(8, $subscription->schedules);
+        $this->assertSame(8 * 72000, $subscription->total_price); // 2 x 40,000 with 10% off, 8 deliveries
+        $this->assertSame('pending_payment', $subscription->status);
 
-        // Simulate that the order day has arrived today.
-        $subscription->update(['next_order_on' => CarbonImmutable::today()->toDateString()]);
+        // Nothing is generated before the package is paid.
+        $first = $subscription->schedules->first();
+        $first->update(['delivery_date' => CarbonImmutable::today()->addDay()->toDateString()]);
+        $this->assertSame(0, $service->dispatchDueDeliveries(CarbonImmutable::today())['dispatched']);
 
-        $result = $service->generateDueOrders(CarbonImmutable::today());
+        $service->markPaid($subscription, 'TEST-REF');
+        $this->assertSame('active', $subscription->fresh()->status);
 
-        $this->assertSame(['created' => 1, 'failed' => 0], $result);
+        // The queue runs synchronously in tests: the job creates and confirms the order.
+        $this->assertSame(1, $service->dispatchDueDeliveries(CarbonImmutable::today())['dispatched']);
+
         $order = Order::where('subscription_id', $subscription->id)->with('items')->firstOrFail();
-        $this->assertSame(72000, $order->subtotal); // 2 x 40,000 with 10% off
-        $this->assertSame(2, $order->items->first()->quantity);
-        $this->assertSame(
-            CarbonImmutable::today()->addWeek()->toDateString(),
-            $subscription->fresh()->next_order_on->toDateString(),
-        );
+        $this->assertSame(Order::STATUS_CONFIRMED, $order->status);
+        $this->assertSame('paid', $order->payment_status);
+        $this->assertSame(72000, $order->subtotal);
+        $this->assertSame(0, $order->shipping_fee);
+        $this->assertSame(48, $batch->fresh()->quantity_on_hand);
+        $this->assertSame('ordered', $first->fresh()->status);
+
+        // Running the command again does not create the delivery twice.
+        $service->dispatchDueDeliveries(CarbonImmutable::today());
+        $this->assertSame(1, Order::where('subscription_id', $subscription->id)->count());
+    }
+
+    public function test_subscription_delivery_short_of_stock_is_flagged_for_sales(): void
+    {
+        $customer = $this->makeUser();
+        $product = $this->makeProduct(40000, 'Cải bó xôi');
+        $plan = SubscriptionPlan::create(['name' => 'Gói xanh', 'discount_percent' => 0, 'is_active' => true]);
+        SubscriptionPlanItem::create(['subscription_plan_id' => $plan->id, 'product_id' => $product->id, 'quantity' => 3]);
+
+        $service = app(SubscriptionService::class);
+        $subscription = $service->subscribe($customer, $plan, ['delivery_days' => [1], ...self::ADDRESS]);
+        $service->markPaid($subscription);
+        $first = $subscription->schedules()->first();
+        $first->update(['delivery_date' => CarbonImmutable::today()->addDay()->toDateString()]);
+
+        // No batch at all: the farm cannot deliver.
+        $service->dispatchDueDeliveries(CarbonImmutable::today());
+
+        $this->assertSame('short', $first->fresh()->status);
+        $this->assertDatabaseCount('orders', 0);
+
+        $this->actingAs($this->makeUser('sales'), 'sanctum')
+            ->getJson('/api/admin/alerts')
+            ->assertOk()
+            ->assertJsonCount(1, 'short_deliveries');
     }
 
     public function test_vnpay_urls_are_signed_and_tampering_is_detected(): void
@@ -223,7 +280,8 @@ class FarmShopTest extends TestCase
         ]);
 
         $gateway = app(VnpayGateway::class);
-        parse_str((string) parse_url($gateway->paymentUrl($order, '127.0.0.1'), PHP_URL_QUERY), $params);
+        $url = $gateway->paymentUrl($order->code, $order->total, 'Thanh toan don hang '.$order->code, '127.0.0.1');
+        parse_str((string) parse_url($url, PHP_URL_QUERY), $params);
 
         $this->assertTrue($gateway->verifySignature($params));
         $this->assertSame((string) ($order->total * 100), $params['vnp_Amount']);
@@ -232,7 +290,7 @@ class FarmShopTest extends TestCase
         $this->assertFalse($gateway->verifySignature($params));
     }
 
-    public function test_vnpay_ipn_marks_order_paid_once(): void
+    public function test_vnpay_ipn_marks_order_paid_once_and_triggers_the_fefo_stock_out(): void
     {
         config([
             'payments.vnpay.tmn_code' => 'TESTTMN',
@@ -241,7 +299,7 @@ class FarmShopTest extends TestCase
 
         $customer = $this->makeUser();
         $product = $this->makeProduct(100000);
-        $this->batchFor($product, 5, now()->addDays(5)->toDateString(), $this->makeUser('admin'));
+        $batch = $this->batchFor($product, 5, now()->addDays(5)->toDateString(), $this->makeUser('admin'));
         $order = app(OrderService::class)->place($customer, [['product' => $product, 'quantity' => 1]], self::ADDRESS + [
             'payment_method' => Order::PAYMENT_VNPAY,
         ]);
@@ -264,6 +322,9 @@ class FarmShopTest extends TestCase
         $order->refresh();
         $this->assertSame('paid', $order->payment_status);
         $this->assertSame('13579', $order->payment_ref);
+        // Tuần 6: the payment notification starts the FEFO stock-out.
+        $this->assertSame(Order::STATUS_CONFIRMED, $order->status);
+        $this->assertSame(4, $batch->fresh()->quantity_on_hand);
     }
 
     public function test_waste_cannot_exceed_stock_and_is_recorded(): void
@@ -282,6 +343,7 @@ class FarmShopTest extends TestCase
         $inventory->recordWaste($batch, 5, 'Héo úa', $admin->id);
 
         $this->assertSame(0, $batch->fresh()->quantity_on_hand);
+        $this->assertSame(5, $batch->fresh()->quantity_wasted);
         $this->assertSame('written_off', $batch->fresh()->status);
         $this->assertDatabaseHas('inventory_movements', [
             'product_batch_id' => $batch->id,
