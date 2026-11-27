@@ -45,7 +45,7 @@ class AuthController extends Controller
         }
 
         if (! $user->is_active) {
-            return response()->json(['message' => 'Tài khoản đã bị khóa.'], 403);
+            abort(403, 'Tài khoản đã bị khóa, vui lòng liên hệ nông trại.');
         }
 
         return response()->json([
