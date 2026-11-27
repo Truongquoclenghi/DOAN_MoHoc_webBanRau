@@ -24,7 +24,13 @@ class MediaStorage
             return $this->uploadToCloudinary($file, $folder, $resourceType, $cloud, $key, $secret);
         }
 
-        return Storage::disk('public')->url($file->store($folder, 'public'));
+        return $this->storeLocally($file, $folder);
+    }
+
+    /** Relative URL (/storage/...) so it works on any host and through the dev proxy. */
+    private function storeLocally(UploadedFile $file, string $folder): string
+    {
+        return '/storage/'.$file->store($folder, 'public');
     }
 
     private function uploadToCloudinary(
@@ -35,18 +41,23 @@ class MediaStorage
         string $key,
         string $secret,
     ): string {
-        $timestamp = time();
+        $params = ['folder' => $folder, 'timestamp' => time()];
+
+        // Tuần 7: photos are resized (max 1600 px) and recompressed by Cloudinary before they are stored.
+        if ($resourceType === 'image') {
+            $params['transformation'] = 'c_limit,w_1600,h_1600/q_auto';
+        }
 
         // Cloudinary signature: sorted params as key=value joined by &, plus the API secret, SHA-1.
-        $toSign = "folder={$folder}&timestamp={$timestamp}";
+        ksort($params);
+        $toSign = collect($params)->map(fn ($value, $name) => "{$name}={$value}")->implode('&');
         $signature = sha1($toSign.$secret);
 
         try {
             $response = Http::attach('file', file_get_contents($file->getRealPath()), $file->getClientOriginalName())
                 ->post("https://api.cloudinary.com/v1_1/{$cloud}/{$resourceType}/upload", [
+                    ...$params,
                     'api_key' => $key,
-                    'timestamp' => $timestamp,
-                    'folder' => $folder,
                     'signature' => $signature,
                 ])
                 ->throw()
@@ -55,7 +66,7 @@ class MediaStorage
             // Fall back to local storage so an upload failure does not block the farm's workflow.
             report($e);
 
-            return Storage::disk('public')->url($file->store($folder, 'public'));
+            return $this->storeLocally($file, $folder);
         }
 
         return $response['secure_url'];
