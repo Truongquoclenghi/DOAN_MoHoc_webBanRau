@@ -4,7 +4,9 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Category;
+use App\Models\FarmLog;
 use App\Models\Product;
+use App\Models\Review;
 use App\Models\SubscriptionPlan;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -50,11 +52,35 @@ class CatalogController extends Controller
         // Only batches that can still be sold are shown, each with its origin and expiry.
         $product->load([
             'category:id,name,slug',
+            'images',
             'batches' => fn ($q) => $q->sellable()
                 ->with('farmPlot:id,code,name,location,certification')
                 ->orderBy('expires_on'),
         ]);
         $product->setAttribute('sellable_stock', (int) $product->batches->sum('quantity_on_hand'));
+
+        // Farming diary timeline: entries for the batches on sale, plus general entries for this crop.
+        $batchIds = $product->batches->pluck('id');
+        $product->setAttribute('timeline', FarmLog::query()
+            ->with(['author:id,name', 'batch:id,batch_code', 'farmPlot:id,name'])
+            ->where(fn ($q) => $q->whereIn('product_batch_id', $batchIds)
+                ->orWhere(fn ($q) => $q->where('product_id', $product->id)->whereNull('product_batch_id')))
+            ->latest('logged_on')
+            ->limit(20)
+            ->get());
+
+        $reviews = Review::query()->where('product_id', $product->id);
+        $product->setAttribute('rating', [
+            'average' => round((float) (clone $reviews)->avg('rating'), 1),
+            'count' => (clone $reviews)->count(),
+        ]);
+        $product->setAttribute('reviews', (clone $reviews)->with('user:id,name')->latest('id')->limit(10)->get());
+
+        // Monthly packages that include this product (buy once or subscribe).
+        $product->setAttribute('plans', SubscriptionPlan::query()
+            ->where('is_active', true)
+            ->whereHas('items', fn ($q) => $q->where('product_id', $product->id))
+            ->get(['id', 'name', 'discount_percent']));
 
         return response()->json($product);
     }

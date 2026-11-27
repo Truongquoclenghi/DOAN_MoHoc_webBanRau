@@ -2,8 +2,6 @@
 
 namespace App\Services\Payments;
 
-use App\Models\Order;
-
 /**
  * VNPay (sandbox-ready) integration.
  *
@@ -18,7 +16,11 @@ class VnpayGateway
         return filled(config('payments.vnpay.tmn_code')) && filled(config('payments.vnpay.hash_secret'));
     }
 
-    public function paymentUrl(Order $order, string $ipAddress): string
+    /**
+     * @param  string  $txnRef  order code, or SUB{id} for a subscription prepayment
+     * @param  int  $amount  VND
+     */
+    public function paymentUrl(string $txnRef, int $amount, string $info, string $ipAddress): string
     {
         $cfg = config('payments.vnpay');
         $now = now('Asia/Ho_Chi_Minh');
@@ -27,16 +29,16 @@ class VnpayGateway
             'vnp_Version' => '2.1.0',
             'vnp_Command' => 'pay',
             'vnp_TmnCode' => $cfg['tmn_code'],
-            'vnp_Amount' => $order->total * 100, // VNPay expects the amount x100
+            'vnp_Amount' => $amount * 100, // VNPay expects the amount x100
             'vnp_CreateDate' => $now->format('YmdHis'),
             'vnp_ExpireDate' => $now->copy()->addMinutes(15)->format('YmdHis'),
             'vnp_CurrCode' => 'VND',
             'vnp_IpAddr' => $ipAddress,
             'vnp_Locale' => 'vn',
-            'vnp_OrderInfo' => 'Thanh toan don hang '.$order->code,
+            'vnp_OrderInfo' => $info,
             'vnp_OrderType' => 'other',
             'vnp_ReturnUrl' => $cfg['return_url'],
-            'vnp_TxnRef' => $order->code,
+            'vnp_TxnRef' => $txnRef,
         ];
 
         ksort($params);

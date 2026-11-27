@@ -1,0 +1,19 @@
+# Dependencies and builds (each part also has its own rules, e.g. backend/.gitignore ignores .env)
+node_modules/
+frontend/dist/
+backend/public/app/
+
+# Unused files kept aside for reference (see _luu-tru/README.md); not part of the project
+_luu-tru/
+
+# Secrets: never commit real keys or database passwords (Tuần 7)
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# OS / editor / local tooling
+.claude/
+.DS_Store
+Thumbs.db
+*.log

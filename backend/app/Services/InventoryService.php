@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Exceptions\InsufficientStockException;
 use App\Models\InventoryMovement;
 use App\Models\Order;
 use App\Models\Product;
@@ -48,7 +49,7 @@ class InventoryService
         }
 
         if ($remaining > 0) {
-            throw new DomainException(
+            throw new InsufficientStockException(
                 "Sản phẩm \"{$product->name}\" không đủ hàng (thiếu {$remaining} {$product->unit})."
             );
         }
@@ -56,10 +57,23 @@ class InventoryService
         return $plan;
     }
 
-    /** Take stock for an order using FEFO and log a sale movement per batch. */
-    public function consume(Product $product, int $quantity, int $orderId): void
+    /** Sellable stock of a product: the sum of its valid batches. */
+    public function available(Product $product): int
     {
-        foreach ($this->allocateFefo($product, $quantity) as $line) {
+        return (int) $product->batches()->sellable()->sum('quantity_on_hand');
+    }
+
+    /**
+     * Take stock for an order using FEFO and log a sale movement per batch.
+     * Must be called inside a DB transaction.
+     *
+     * @return array<int, array{batch: ProductBatch, quantity: int}> what was taken from each batch
+     */
+    public function consume(Product $product, int $quantity, int $orderId): array
+    {
+        $plan = $this->allocateFefo($product, $quantity);
+
+        foreach ($plan as $line) {
             /** @var ProductBatch $batch */
             $batch = $line['batch'];
             $batch->decrement('quantity_on_hand', $line['quantity']);
@@ -76,6 +90,8 @@ class InventoryService
                 'reason' => 'Bán theo đơn hàng (FEFO)',
             ]);
         }
+
+        return $plan;
     }
 
     /** Put back the stock an order consumed (used when an order is cancelled). */
@@ -108,9 +124,9 @@ class InventoryService
     }
 
     /** Record internal waste / damaged / destroyed stock (xuất hủy, hao hụt). */
-    public function recordWaste(ProductBatch $batch, int $quantity, string $reason, int $userId): ProductBatch
+    public function recordWaste(ProductBatch $batch, int $quantity, string $reason, int $userId, ?string $mediaUrl = null): ProductBatch
     {
-        return DB::transaction(function () use ($batch, $quantity, $reason, $userId) {
+        return DB::transaction(function () use ($batch, $quantity, $reason, $userId, $mediaUrl) {
             $batch = ProductBatch::whereKey($batch->id)->lockForUpdate()->firstOrFail();
 
             if ($quantity <= 0 || $quantity > $batch->quantity_on_hand) {
@@ -118,6 +134,7 @@ class InventoryService
             }
 
             $batch->decrement('quantity_on_hand', $quantity);
+            $batch->increment('quantity_wasted', $quantity);
             $batch->refresh();
 
             if ($batch->quantity_on_hand === 0) {
@@ -130,6 +147,7 @@ class InventoryService
                 'type' => InventoryMovement::TYPE_WASTE,
                 'quantity' => -$quantity,
                 'reason' => $reason,
+                'media_url' => $mediaUrl,
             ]);
 
             return $batch;
@@ -160,12 +178,12 @@ class InventoryService
         });
     }
 
-    /** Mark batches past their expiry date as expired. Returns how many were updated. */
+    /** Mark batches whose expiry date has arrived as expired (they are not sellable on that day). */
     public function expireDueBatches(): int
     {
         return ProductBatch::query()
             ->where('status', ProductBatch::STATUS_AVAILABLE)
-            ->whereDate('expires_on', '<', now()->toDateString())
+            ->whereDate('expires_on', '<=', now()->toDateString())
             ->update(['status' => ProductBatch::STATUS_EXPIRED]);
     }
 

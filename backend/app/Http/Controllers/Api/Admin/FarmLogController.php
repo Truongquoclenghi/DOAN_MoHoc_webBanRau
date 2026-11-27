@@ -4,22 +4,30 @@ namespace App\Http\Controllers\Api\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\FarmLog;
+use App\Models\ProductBatch;
 use App\Services\MediaStorage;
+use DomainException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
-/** Cultivation diary (nhật ký canh tác) entries with photo or video evidence. */
+/**
+ * Farming diary (nhật ký canh tác) written by farm staff, with photo or video evidence.
+ * An entry belongs to a plot and, when it is about a specific harvest, to that batch:
+ * the batch's QR code then shows the whole history (Tuần 2 use case 4, Tuần 3 ERD).
+ */
 class FarmLogController extends Controller
 {
     public function index(Request $request): JsonResponse
     {
-        $query = FarmLog::query()->with(['farmPlot:id,code,name', 'product:id,name'])->latest('logged_on');
+        $query = FarmLog::query()
+            ->with(['farmPlot:id,code,name', 'product:id,name', 'batch:id,batch_code', 'author:id,name'])
+            ->latest('logged_on')
+            ->latest('id');
 
-        if ($plotId = $request->query('farm_plot_id')) {
-            $query->where('farm_plot_id', $plotId);
-        }
-        if ($productId = $request->query('product_id')) {
-            $query->where('product_id', $productId);
+        foreach (['farm_plot_id', 'product_id', 'product_batch_id'] as $filter) {
+            if ($value = $request->query($filter)) {
+                $query->where($filter, $value);
+            }
         }
 
         return response()->json($query->paginate(30));
@@ -28,13 +36,27 @@ class FarmLogController extends Controller
     public function store(Request $request, MediaStorage $media): JsonResponse
     {
         $data = $request->validate([
-            'farm_plot_id' => ['required', 'integer', 'exists:farm_plots,id'],
+            'product_batch_id' => ['nullable', 'integer', 'exists:product_batches,id'],
+            'farm_plot_id' => ['nullable', 'required_without:product_batch_id', 'integer', 'exists:farm_plots,id'],
             'product_id' => ['nullable', 'integer', 'exists:products,id'],
             'type' => ['required', 'in:'.implode(',', FarmLog::TYPES)],
             'description' => ['required', 'string', 'max:2000'],
-            'logged_on' => ['required', 'date'],
-            'media' => ['nullable', 'file', 'mimes:jpg,jpeg,png,webp,mp4', 'max:51200'],
+            'logged_on' => ['required', 'date', 'before_or_equal:today'],
+            'media' => ['nullable', 'file', 'mimes:jpg,jpeg,png,webp,mp4,mov', 'max:51200'],
+        ], [
+            'farm_plot_id.required_without' => 'Hãy chọn khu canh tác hoặc lô hàng.',
         ]);
+
+        // A log written for a batch inherits the batch's product and plot.
+        if (! empty($data['product_batch_id'])) {
+            $batch = ProductBatch::findOrFail($data['product_batch_id']);
+            $data['product_id'] = $batch->product_id;
+            $data['farm_plot_id'] = $batch->farm_plot_id ?? ($data['farm_plot_id'] ?? null);
+
+            if ($data['farm_plot_id'] === null) {
+                throw new DomainException('Lô hàng chưa gắn khu canh tác, hãy chọn khu canh tác.');
+            }
+        }
 
         $mediaUrl = null;
         $mediaType = null;
@@ -52,7 +74,7 @@ class FarmLogController extends Controller
             'created_by' => $request->user()->id,
         ]);
 
-        return response()->json($log->load(['farmPlot:id,code,name', 'product:id,name']), 201);
+        return response()->json($log->load(['farmPlot:id,code,name', 'product:id,name', 'batch:id,batch_code', 'author:id,name']), 201);
     }
 
     public function destroy(FarmLog $farmLog): JsonResponse

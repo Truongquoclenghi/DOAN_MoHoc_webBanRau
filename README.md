@@ -1,38 +1,19 @@
-# Website thương mại điện tử nông sản sạch (Single Farm)
+# Nông trại Xanh Đà Lạt – Website TMĐT nông sản sạch (Đồ án 11)
 
-Nền tảng TMĐT dành riêng cho một nông trại: bán nông sản tươi, **truy xuất nguồn gốc bằng QR theo từng lô**, nhật ký canh tác, quản lý tồn kho theo lô hạn sử dụng (FEFO), gói đăng ký hàng tháng, tích điểm và khiếu nại.
+Nền tảng thương mại điện tử khép kín cho **một nông trại** (Single Farm): bán trực tiếp từ vườn đến bàn ăn,
+quản lý tồn kho theo **lô hàng và hạn sử dụng**, tự động xuất kho **FEFO**, truy xuất nguồn gốc bằng **mã QR**,
+nhật ký canh tác, gói rau định kỳ trả trước, khiếu nại có ảnh minh chứng.
 
-- **Backend:** Laravel 12 REST API + Laravel Sanctum (token), MySQL (production) / SQLite (mặc định khi chạy thử).
-- **Frontend:** React 19 + React Router + Vite (SPA), có trang quản trị.
-- **Dịch vụ bên thứ ba:** VNPay (chữ ký HMAC-SHA512 theo tài liệu VNPay), Cloudinary (tùy chọn), cổng thanh toán giả lập cho môi trường thử.
+- **Backend:** Laravel 12 (PHP 8.2+), REST API, Sanctum token, MySQL (production) / SQLite (dev, test)
+- **Frontend:** React 19 + Vite (giữ React theo lựa chọn của nhóm; tài liệu gốc gợi ý Blade + Tailwind)
+- **Dịch vụ ngoài:** VNPay (có cổng giả lập), Cloudinary (tùy chọn), Google Maps / OpenStreetMap (tính phí ship)
 
-## 1. Phạm vi theo ma trận MoSCoW (Tuần 1) và trạng thái
+Thông tin nông trại (tên, địa chỉ, tọa độ, câu chuyện) nằm trong `backend/config/farm.php` và đổi được qua `.env`
+(`FARM_NAME`, `FARM_ADDRESS`, `FARM_LATITUDE`…). Mặc định là một nông trại giả định ở Đà Lạt.
 
-| Mức | Chức năng | Trạng thái | Ghi chú triển khai |
-|---|---|---|---|
-| Must | Giỏ hàng, đặt hàng, thanh toán | Xong | COD, VNPay (sandbox), cổng giả lập |
-| Must | Tồn kho theo **lô** (batch) có hạn sử dụng | Xong | `product_batches`, mỗi lô có mã QR riêng |
-| Must | Xuất kho tự động theo **FEFO** | Xong | Trừ kho lô sắp hết hạn trước khi bán; `GET /admin/products/{id}/fefo-preview` xem trước |
-| Must | Tạo và truy xuất mã QR | Xong (tạo + trang truy xuất) | Quét bằng máy quét mã (gõ + Enter) hoặc nhập tay. Chưa quét bằng camera |
-| Must | Ghi nhận xuất hủy / hao hụt | Xong | `POST /admin/batches/{id}/waste`, có audit trong `inventory_movements` |
-| Should | Mua theo gói định kỳ tự sinh đơn | Xong | 4 lần giao/tháng vào thứ đã chọn; lệnh `subscriptions:generate-orders` chạy hằng ngày |
-| Should | Nhật ký canh tác (ảnh/video) | Xong | Hiển thị trên trang truy xuất QR |
-| Should | Tích điểm thành viên | Xong | 10.000 ₫ = 1 điểm; 1 điểm = 1.000 ₫; tối đa 50% giá trị đơn |
-| Should | Khiếu nại kèm ảnh | Xong | Admin phản hồi và đổi trạng thái |
-| Could | Phí ship động | Một phần | Tính theo khoảng cách khách nhập, **chưa** dùng Google Maps / Ahamove |
-| Could | Flash sale cho lô sắp hết hạn | Chưa làm | Đã có cảnh báo lô sắp hết hạn và giá trị tồn để làm cơ sở |
-| Could | MoMo / VNPay thực tế | Một phần | VNPay đã có luồng URL, chữ ký, IPN; **chưa kiểm thử với merchant thật** |
-| Won't | App di động, đa gian hàng, AI dự báo | Không làm | Đúng như phạm vi |
+## Cài đặt và chạy (máy local)
 
-## 2. Yêu cầu chức năng đồ án (Tuần 3)
-
-Đăng ký/đăng nhập · tìm kiếm · mua hàng · danh mục · xem giá · nhật ký canh tác/QR · tích điểm · giỏ hàng · thanh toán · gói đăng ký hàng tháng · quản lý ô (lô đất) · quản lý đơn hàng/khiếu nại · quản lý tài khoản · doanh thu/báo cáo.
-
-## 3. Chạy dự án
-
-Yêu cầu: PHP 8.2+, Composer, Node.js 20+.
-
-Backend (Laravel API, cổng 8000):
+Yêu cầu: PHP 8.2+ (pdo_sqlite), Composer, Node.js 20+.
 
 ```powershell
 cd backend
@@ -40,17 +21,13 @@ composer install
 copy .env.example .env
 php artisan key:generate
 php artisan migrate --seed
+php artisan db:seed --class=ProduceCatalogSeeder
+php artisan db:seed --class=FefoTestSeeder
 php artisan storage:link
 php artisan serve
 ```
 
-Lập lịch chạy nền (đơn định kỳ, đánh dấu lô hết hạn) khi phát triển:
-
-```powershell
-php artisan schedule:work
-```
-
-Frontend (cổng 5173, tự proxy `/api` sang backend):
+Cửa sổ thứ hai:
 
 ```powershell
 cd frontend
@@ -58,68 +35,74 @@ npm install
 npm run dev
 ```
 
-Mở http://localhost:5173
+Mở http://localhost:5173. Tài liệu API (Swagger UI): http://localhost:8000/api-docs/
 
-**Tài khoản demo** (tạo bởi seeder):
+Cửa sổ thứ ba (hàng đợi: email hóa đơn, tạo đơn gói định kỳ) và tác vụ định kỳ:
 
-- Quản trị: `admin@farm.local` / `password`
-- Khách hàng: `khach@farm.local` / `password`
+```powershell
+cd backend
+php artisan queue:work
+```
 
-Kiểm thử backend:
+```powershell
+cd backend
+php artisan schedule:work
+```
+
+Ảnh sản phẩm: đặt file `<slug>.jpg` vào `backend/storage/app/public/anh-san-pham` rồi chạy
+`php artisan db:seed --class=ProductPhotoSeeder`.
+
+### Tài khoản dùng thử (mật khẩu: `password`)
+
+| Vai trò | Email | Được làm |
+|---|---|---|
+| Khách hàng | khach@farm.local | Mua lẻ, gói định kỳ, quét QR, đánh giá, khiếu nại |
+| Nhân viên nông trại | staff@farm.local | Lô hàng, nhập lô, in QR, xuất hủy, nhật ký canh tác. **Không** xem đơn, khách, doanh thu |
+| Bán hàng / CSKH | sales@farm.local | Xác nhận đơn, giao hàng, khiếu nại, lịch giao gói. **Không** tạo lô, không đổi tồn kho |
+| Quản trị viên | admin@farm.local | Tất cả + báo cáo, sản phẩm, nhân sự, cấu hình cảnh báo |
+
+### Kiểm thử
 
 ```powershell
 cd backend
 php artisan test
 ```
 
-Bộ kiểm thử gồm 14 ca: FEFO, hết hạn không được bán, checkout và trừ kho, hủy đơn hoàn kho và điểm, tích điểm và dùng điểm, gói đăng ký sinh đơn, chữ ký VNPay (ký, phát hiện sửa đổi, IPN chỉ xử lý một lần), xuất hủy không vượt tồn, phân quyền admin, truy xuất QR.
+46 test tự động (FEFO, phân quyền 4 vai trò, luồng đơn, VNPay IPN, gói định kỳ, khiếu nại 24 giờ, phí ship…).
+Kịch bản Postman: `backend/docs/postman/farm-ecommerce.postman_collection.json`.
 
-## 4. Cấu hình (.env)
+## Luồng nghiệp vụ chính
 
-| Biến | Ý nghĩa |
-|---|---|
-| `PAYMENT_MOCK_ENABLED` | `true` để dùng cổng thanh toán giả lập. **Đặt `false` khi đưa lên production.** |
-| `VNPAY_TMN_CODE`, `VNPAY_HASH_SECRET`, `VNPAY_URL` | Thông số VNPay sandbox. Để trống sẽ dùng cổng giả lập |
-| `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` | Lưu ảnh lên Cloudinary. Để trống sẽ lưu ở đĩa `public` |
-| `FRONTEND_URL` | Địa chỉ frontend, dùng để chuyển hướng sau thanh toán |
-| `SHOP_*` | Ngưỡng miễn phí ship, phí cơ bản, phí theo km |
+1. **Đặt hàng:** khách đặt → backend đọc lại giá và tồn kho từ CSDL (không tin giá từ trình duyệt) → đơn `Chờ xác nhận`, **chưa trừ kho**.
+2. **Xác nhận = trừ kho FEFO:** Sales bấm xác nhận (COD) hoặc VNPay gửi IPN thanh toán thành công → hệ thống lấy lô có hạn
+   gần nhất (còn hạn), thiếu thì lấy tiếp lô sau. Chi tiết đơn ghi rõ từng lô (3 kg lô A + 7 kg lô B = 2 dòng), nên khiếu nại
+   truy ngược được về lô. Không đủ hàng → đơn `Thiếu hàng`, báo đỏ cho Sales, không trừ gì.
+3. **Gói định kỳ:** khách chọn gói và 1–3 ngày giao/tuần (vd. thứ 3 và thứ 6), trả trước 28 ngày. Mỗi ngày giao là một dòng
+   `delivery_schedules`; trước 1 ngày, một job trong hàng đợi tạo và xác nhận đơn. Thiếu hàng → lịch giao `Thiếu hàng`, Sales gọi khách đổi sản phẩm.
+4. **Khiếu nại:** chỉ cho đơn đã giao, trong **24 giờ**, bắt buộc ảnh .jpg/.png ≤ 5 MB (kiểm tra ở trình duyệt và server).
+   Sales chấp nhận (hoàn tiền / giao bù) hoặc từ chối.
+5. **Cảnh báo xả hàng:** lô còn ≤ N ngày (Admin cấu hình, mặc định 2) hiện cảnh báo đỏ kèm giá xả đề xuất.
+6. **Hết phiên đăng nhập:** token hết hạn sau `SANCTUM_EXPIRATION` phút → popup "đăng nhập lại" thay vì lỗi thô (tương đương xử lý 419 của Blade).
 
-Để dùng MySQL, đổi `DB_CONNECTION=mysql` và các biến `DB_*` trong `.env`.
+## Đối chiếu yêu cầu các tuần
 
-## 5. Quản lý rủi ro kỹ thuật (theo yêu cầu Tuần 1)
+| Tuần | Yêu cầu | Trong mã nguồn |
+|---|---|---|
+| 1 | Single Farm, MoSCoW, rủi ro | `config/farm.php`; cổng thanh toán giả lập khi API bên thứ 3 lỗi (`PAYMENT_MOCK_ENABLED`) |
+| 2 | 4 tác nhân, 5 use case khó, phi chức năng | Middleware `role:` (`routes/api.php`), Bcrypt, giao diện mobile-first |
+| 3 | ERD: Batches (hao hụt, QR), Order_Details → batch_id, Farming_Logs → batch, Subscriptions + Delivery_Schedules, index | `database/migrations/2026_11_27_*`, index `expires_on`, `orders(status, created_at)` |
+| 4 | Màn hình chi tiết sản phẩm + màn hình lô hàng/hao hụt trên di động | `pages/Shop.jsx` (ProductPage), `pages/backoffice/FarmTabs.jsx` |
+| 5 | Migrations, seeders/factories, FEFO service, QR service, RESTful, lỗi JSON chung | `InventoryService`, `BatchController::qr`, `ApiErrorResponse`, Swagger `/api-docs`, Postman |
+| 6 | AJAX + spinner + toast, xử lý hết phiên, phí ship theo bản đồ, VNPay IPN → FEFO, khiếu nại validate file | `ui.jsx`, `auth.jsx`, `ShippingService`, `PaymentController`, `Account.jsx` |
+| 7 | Không tin giá từ client, .env an toàn, phân quyền endpoint, nén ảnh, Queue, triển khai, CI | `OrderService::place`, `.gitignore`, `media.js` + Cloudinary, `app/Jobs`, `Dockerfile`, `render.yaml`, `.github/workflows/ci.yml` |
 
-| Rủi ro | Phương án dự phòng đã triển khai |
-|---|---|
-| API thanh toán bên thứ ba lỗi hoặc chưa có tài khoản | Cổng thanh toán giả lập (`PAYMENT_MOCK_ENABLED`) chạy được toàn bộ luồng đặt hàng và thanh toán |
-| Cloudinary lỗi hoặc chưa cấu hình | Tự động lưu ảnh ở đĩa cục bộ |
-| Đặt đơn khi tồn kho vừa thay đổi | Toàn bộ đặt hàng nằm trong một transaction, khóa dòng lô (`lockForUpdate`); thiếu hàng thì không tạo đơn nào |
-| Gửi lặp IPN của VNPay | Đơn đã xác nhận trả mã `02`, không cộng điểm hai lần |
-| Lô quá hạn vẫn được bán | Truy vấn bán hàng loại lô hết hạn; lệnh chạy 00:05 đánh dấu lô hết hạn |
+Hướng dẫn triển khai: [docs/DEPLOY.md](docs/DEPLOY.md) · Hướng dẫn sử dụng cho 3 nhóm người dùng: [docs/HUONG-DAN-SU-DUNG.md](docs/HUONG-DAN-SU-DUNG.md) ·
+Quy ước nhánh và commit: [docs/GIT-FLOW.md](docs/GIT-FLOW.md)
 
-## 6. Hạn chế đã biết
+## Giới hạn hiện tại
 
-- Chưa kiểm thử với cổng VNPay thật (cần TMN code và hash secret của merchant). Chữ ký đã được kiểm thử nội bộ.
-- Phí ship chưa lấy khoảng cách tự động từ bản đồ.
-- Chưa có flash sale tự động.
-- Quét QR bằng camera chưa có; trang truy xuất là đường dẫn công khai cho mọi mã lô.
-- Hủy đơn đã thanh toán chưa tự động hoàn tiền qua cổng; cần xử lý thủ công.
-- Gói đăng ký chỉ dùng thanh toán khi nhận hàng (COD).
-
-## 7. Cấu trúc thư mục
-
-```
-backend/
-  app/Services/          # InventoryService (FEFO, lô, xuất hủy), OrderService, PointsService,
-                         # ShippingService, SubscriptionService, MediaStorage, Payments/VnpayGateway
-  app/Http/Controllers/Api/        # API cho khách hàng
-  app/Http/Controllers/Api/Admin/  # API quản trị
-  database/migrations/   # 16 migration: lô, tồn kho, nhật ký, đơn, gói, khiếu nại, điểm
-  database/seeders/DemoSeeder.php
-  routes/api.php         # toàn bộ API
-  tests/Feature/FarmShopTest.php
-frontend/
-  src/pages/Shop.jsx     # sản phẩm, chi tiết, giỏ hàng, thanh toán, cổng giả lập
-  src/pages/Account.jsx  # đơn hàng, điểm, gói đăng ký, khiếu nại
-  src/pages/Trace.jsx    # trang truy xuất QR và nhật ký canh tác
-  src/pages/Admin.jsx    # tổng quan, sản phẩm & lô, nông trại, đơn, khiếu nại, gói, người dùng
-```
+- Phí ship khi không có Google Maps key dùng OpenStreetMap: khoảng cách đường chim bay × 1,3 (ước tính). Không tra được địa chỉ thì dùng số km khách nhập.
+- VNPay mới kiểm tra chữ ký theo tài liệu, chưa chạy với tài khoản merchant thật. Hoàn tiền thực hiện thủ công (đơn được đánh dấu `Chờ hoàn tiền`).
+- Gói định kỳ chỉ trả trước online (VNPay hoặc cổng giả lập).
+- Ảnh lưu ở ổ đĩa local khi chưa cấu hình Cloudinary; trên Render ổ đĩa bị xóa mỗi lần deploy nên production cần Cloudinary.
+- Xóa ảnh không xóa file trên Cloudinary.

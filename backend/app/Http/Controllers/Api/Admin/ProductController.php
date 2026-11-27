@@ -5,47 +5,55 @@ namespace App\Http\Controllers\Api\Admin;
 use App\Http\Controllers\Controller;
 use App\Models\Product;
 use App\Models\ProductBatch;
-use App\Services\MediaStorage;
+use App\Services\ProductImageService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 
 class ProductController extends Controller
 {
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
         $products = Product::query()
             ->with('category:id,name')
-            ->withSum(['batches as stock' => fn ($q) => $q->where('status', ProductBatch::STATUS_AVAILABLE)], 'quantity_on_hand')
+            ->withSum(['batches as stock' => fn ($q) => $q->sellable()], 'quantity_on_hand')
             ->latest('id')
-            ->paginate(20);
+            ->paginate(min(max((int) $request->query('per_page', 20), 1), 100));
 
         return response()->json($products);
     }
 
-    public function store(Request $request, MediaStorage $media): JsonResponse
+    public function store(Request $request, ProductImageService $images): JsonResponse
     {
         $data = $this->validated($request, creating: true);
+        $file = $request->file('image');
+        unset($data['image']);
 
         $data['slug'] = Str::slug($data['name']).'-'.Str::lower(Str::random(4));
-        if ($request->hasFile('image')) {
-            $data['image_url'] = $media->store($request->file('image'), 'products');
+        $product = Product::create($data);
+
+        // An uploaded photo goes into the gallery and becomes the primary image.
+        if ($file !== null) {
+            $images->add($product, $file, null, $product->name);
         }
 
-        return response()->json(Product::create($data), 201);
+        return response()->json($product->fresh()->load('images'), 201);
     }
 
-    public function update(Request $request, Product $product, MediaStorage $media): JsonResponse
+    public function update(Request $request, Product $product, ProductImageService $images): JsonResponse
     {
         $data = $this->validated($request, creating: false);
-
-        if ($request->hasFile('image')) {
-            $data['image_url'] = $media->store($request->file('image'), 'products');
-        }
+        $file = $request->file('image');
+        unset($data['image']);
 
         $product->update($data);
 
-        return response()->json($product->fresh());
+        // A new upload is added to the gallery; it does not replace the existing photos.
+        if ($file !== null) {
+            $images->add($product, $file, null, $product->name);
+        }
+
+        return response()->json($product->fresh()->load('images'));
     }
 
     /** Products that already have sales history are deactivated rather than deleted. */

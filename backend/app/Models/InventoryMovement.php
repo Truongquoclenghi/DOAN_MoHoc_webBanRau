@@ -20,6 +20,7 @@ class InventoryMovement extends Model
         'type',
         'quantity',
         'reason',
+        'media_url',
     ];
 
     protected function casts(): array
@@ -35,5 +36,10 @@ class InventoryMovement extends Model
     public function order(): BelongsTo
     {
         return $this->belongsTo(Order::class);
+    }
+
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(User::class);
     }
 }
