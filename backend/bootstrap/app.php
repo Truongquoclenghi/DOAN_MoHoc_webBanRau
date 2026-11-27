@@ -13,14 +13,10 @@ return Application::configure(basePath: dirname(__DIR__))
     )
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->alias([
-            'admin' => \App\Http\Middleware\EnsureUserIsAdmin::class,
+            'role' => \App\Http\Middleware\EnsureUserHasRole::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
-        // Business-rule violations (out of stock, not enough points, ...) become 422 JSON responses.
-        $exceptions->render(function (\DomainException $e, $request) {
-            if ($request->expectsJson()) {
-                return response()->json(['message' => $e->getMessage()], 422);
-            }
-        });
+        // Every API error gets the same JSON shape: {"status": "error", "message": "..."}.
+        $exceptions->render(fn (\Throwable $e, $request) => \App\Exceptions\ApiErrorResponse::from($e, $request));
     })->create();

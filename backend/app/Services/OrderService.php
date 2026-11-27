@@ -2,6 +2,8 @@
 
 namespace App\Services;
 
+use App\Exceptions\InsufficientStockException;
+use App\Jobs\SendOrderConfirmation;
 use App\Models\Order;
 use App\Models\OrderItem;
 use App\Models\Product;
@@ -11,6 +13,18 @@ use DomainException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
+/**
+ * Order lifecycle.
+ *
+ *   place()    customer checks out: prices and stock are re-read from the database (never
+ *              trusted from the browser) but no stock is taken yet. Status: pending.
+ *   confirm()  Sales confirms a COD order, or the online payment succeeds (VNPay IPN):
+ *              stock is taken from batches with FEFO and every order line records the batch
+ *              it came from (3 kg from lot A + 7 kg from lot B = two lines). Status: confirmed.
+ *              If the batches cannot cover the order the status becomes stock_issue so Sales
+ *              can call the customer, and nothing is taken.
+ *   shipping -> delivered, or cancelled (stock and points are given back).
+ */
 class OrderService
 {
     public function __construct(
@@ -20,9 +34,6 @@ class OrderService
     ) {}
 
     /**
-     * Create an order from product lines. Everything happens in one transaction:
-     * if any product is short on stock, nothing is saved.
-     *
      * @param  array<int, array{product: Product, quantity: int}>  $lines
      * @param  array{
      *     shipping_name: string, shipping_phone: string, shipping_address: string,
@@ -37,19 +48,21 @@ class OrderService
         }
 
         $paymentMethod = $data['payment_method'] ?? Order::PAYMENT_COD;
-        if (! in_array($paymentMethod, [Order::PAYMENT_COD, Order::PAYMENT_VNPAY], true)) {
+        $allowed = [Order::PAYMENT_COD, Order::PAYMENT_VNPAY, Order::PAYMENT_SUBSCRIPTION];
+        if (! in_array($paymentMethod, $allowed, true)) {
             throw new DomainException('Phương thức thanh toán không hợp lệ.');
         }
 
+        $prepaid = $paymentMethod === Order::PAYMENT_SUBSCRIPTION;
         $discountPercent = (int) ($data['discount_percent'] ?? 0);
 
-        return DB::transaction(function () use ($user, $lines, $data, $paymentMethod, $discountPercent) {
+        return DB::transaction(function () use ($user, $lines, $data, $paymentMethod, $prepaid, $discountPercent) {
             $subtotal = 0;
             $prepared = [];
 
             foreach ($lines as $line) {
-                /** @var Product $product */
-                $product = $line['product'];
+                // Re-read the product so the price always comes from the database.
+                $product = Product::whereKey($line['product']->id)->firstOrFail();
                 $quantity = (int) $line['quantity'];
 
                 if (! $product->is_active) {
@@ -57,6 +70,13 @@ class OrderService
                 }
                 if ($quantity < 1) {
                     throw new DomainException('Số lượng không hợp lệ.');
+                }
+
+                $available = $this->inventory->available($product);
+                if ($quantity > $available) {
+                    throw new InsufficientStockException(
+                        "Sản phẩm \"{$product->name}\" chỉ còn {$available} {$product->unit} trong các lô còn hạn."
+                    );
                 }
 
                 $unitPrice = intdiv($product->price * (100 - $discountPercent), 100);
@@ -67,9 +87,9 @@ class OrderService
             }
 
             $distanceKm = (int) ($data['distance_km'] ?? 0);
-            $shippingFee = $this->shipping->fee($subtotal, $distanceKm);
+            $shippingFee = $prepaid ? 0 : $this->shipping->fee($subtotal, $distanceKm);
 
-            $pointsToUse = (int) ($data['points_to_use'] ?? 0);
+            $pointsToUse = $prepaid ? 0 : (int) ($data['points_to_use'] ?? 0);
             $discount = 0;
             $pointsUsed = 0;
 
@@ -87,7 +107,9 @@ class OrderService
                 'subscription_id' => ($data['subscription'] ?? null)?->id,
                 'status' => Order::STATUS_PENDING,
                 'payment_method' => $paymentMethod,
-                'payment_status' => 'unpaid',
+                // A subscription delivery was paid for when the package was bought.
+                'payment_status' => $prepaid ? 'paid' : 'unpaid',
+                'paid_at' => $prepaid ? now() : null,
                 'subtotal' => $subtotal,
                 'shipping_fee' => $shippingFee,
                 'points_discount' => $discount,
@@ -103,9 +125,6 @@ class OrderService
             ]);
 
             foreach ($prepared as $line) {
-                // Throws (and rolls back the whole order) when stock is insufficient.
-                $this->inventory->consume($line['product'], $line['quantity'], $order->id);
-
                 OrderItem::create([
                     'order_id' => $order->id,
                     'product_id' => $line['product']->id,
@@ -124,44 +143,81 @@ class OrderService
         });
     }
 
-    /** Mark an order as paid (idempotent) and award loyalty points once. */
-    public function markPaid(Order $order, ?string $paymentRef = null): void
+    /**
+     * Take the order's stock from batches (FEFO) and mark it confirmed.
+     *
+     * @throws InsufficientStockException when the batches cannot cover it (order becomes stock_issue)
+     */
+    public function confirm(Order $order): Order
     {
-        if ($order->paid_at !== null) {
-            return;
+        try {
+            DB::transaction(fn () => $this->allocate($order));
+        } catch (InsufficientStockException $e) {
+            Order::whereKey($order->id)
+                ->whereIn('status', [Order::STATUS_PENDING, Order::STATUS_STOCK_ISSUE])
+                ->update(['status' => Order::STATUS_STOCK_ISSUE, 'issue_note' => $e->getMessage()]);
+
+            throw $e;
         }
 
-        DB::transaction(function () use ($order, $paymentRef) {
-            $order = Order::whereKey($order->id)->lockForUpdate()->firstOrFail();
-            if ($order->paid_at !== null) {
-                return;
-            }
+        SendOrderConfirmation::dispatch($order->id)->afterCommit();
 
-            $earned = $this->points->earnFor($order->total);
-            $order->update([
-                'payment_status' => 'paid',
-                'payment_ref' => $paymentRef ?? $order->payment_ref,
-                'paid_at' => now(),
-                'points_earned' => $earned,
-                'status' => $order->status === Order::STATUS_PENDING ? Order::STATUS_PAID : $order->status,
-            ]);
-
-            $this->points->credit($order->user, $earned, 'Tích điểm đơn '.$order->code, $order->id);
-        });
+        return $order->refresh()->load('items');
     }
 
-    /** Move an order through its lifecycle. */
+    /** Like confirm(), but reports a shortage instead of throwing (used by payment callbacks and jobs). */
+    public function tryConfirm(Order $order): bool
+    {
+        try {
+            $this->confirm($order);
+
+            return true;
+        } catch (InsufficientStockException) {
+            return false;
+        }
+    }
+
+    /** Mark an order as paid (idempotent), award loyalty points once, then take its stock. */
+    public function markPaid(Order $order, ?string $paymentRef = null): void
+    {
+        if ($order->paid_at === null) {
+            DB::transaction(function () use ($order, $paymentRef) {
+                $locked = Order::whereKey($order->id)->lockForUpdate()->firstOrFail();
+                if ($locked->paid_at !== null) {
+                    return;
+                }
+
+                $earned = $this->points->earnFor($locked->total);
+                $locked->update([
+                    'payment_status' => 'paid',
+                    'payment_ref' => $paymentRef ?? $locked->payment_ref,
+                    'paid_at' => now(),
+                    'points_earned' => $earned,
+                ]);
+
+                $this->points->credit($locked->user, $earned, 'Tích điểm đơn '.$locked->code, $locked->id);
+            });
+        }
+
+        // Online payment received: start the FEFO stock-out straight away (Tuần 6).
+        $order->refresh();
+        if ($order->status === Order::STATUS_PENDING) {
+            $this->tryConfirm($order);
+        }
+    }
+
+    /** Move an order through its lifecycle (Sales / Admin). */
     public function updateStatus(Order $order, string $status): Order
     {
         match ($status) {
-            Order::STATUS_PAID => $this->markPaid($order),
+            Order::STATUS_CONFIRMED => $this->confirm($order),
             Order::STATUS_SHIPPING => $this->moveToShipping($order),
             Order::STATUS_DELIVERED => $this->markDelivered($order),
             Order::STATUS_CANCELLED => $this->cancel($order),
             default => throw new DomainException('Trạng thái không hợp lệ.'),
         };
 
-        return $order->refresh();
+        return $order->refresh()->load('items');
     }
 
     public function cancel(Order $order): void
@@ -169,10 +225,12 @@ class OrderService
         DB::transaction(function () use ($order) {
             $order = Order::whereKey($order->id)->lockForUpdate()->firstOrFail();
 
-            if (! in_array($order->status, [Order::STATUS_PENDING, Order::STATUS_PAID], true)) {
+            $cancellable = [Order::STATUS_PENDING, Order::STATUS_STOCK_ISSUE, Order::STATUS_CONFIRMED];
+            if (! in_array($order->status, $cancellable, true)) {
                 throw new DomainException('Đơn đang giao hoặc đã kết thúc, không thể hủy.');
             }
 
+            // Only confirmed orders took stock; restoreForOrder finds nothing otherwise.
             $this->inventory->restoreForOrder($order);
 
             if ($order->points_used > 0) {
@@ -185,14 +243,61 @@ class OrderService
                 $this->points->debit($order->user, $reclaim, 'Thu hồi điểm do hủy đơn '.$order->code, $order->id);
             }
 
-            $order->update(['status' => Order::STATUS_CANCELLED]);
+            $update = ['status' => Order::STATUS_CANCELLED];
+            if ($order->isPaid() && $order->payment_method === Order::PAYMENT_VNPAY) {
+                $update['payment_status'] = 'refund_pending';
+                $update['issue_note'] = 'Khách đã thanh toán online: cần hoàn tiền.';
+            }
+
+            $order->update($update);
         });
+    }
+
+    /** Runs inside a transaction: replace each product line with one line per batch used. */
+    private function allocate(Order $order): void
+    {
+        $order = Order::whereKey($order->id)->lockForUpdate()->firstOrFail();
+
+        if (! in_array($order->status, [Order::STATUS_PENDING, Order::STATUS_STOCK_ISSUE], true)) {
+            throw new DomainException('Chỉ xác nhận được đơn đang chờ xử lý.');
+        }
+
+        $lines = $order->items()->whereNull('product_batch_id')->with('product')->get();
+
+        foreach ($lines as $line) {
+            if ($line->product === null) {
+                throw new DomainException("Sản phẩm \"{$line->product_name}\" không còn tồn tại.");
+            }
+
+            $plan = $this->inventory->consume($line->product, $line->quantity, $order->id);
+
+            foreach ($plan as $part) {
+                OrderItem::create([
+                    'order_id' => $order->id,
+                    'product_id' => $line->product_id,
+                    'product_batch_id' => $part['batch']->id,
+                    'batch_code' => $part['batch']->batch_code,
+                    'product_name' => $line->product_name,
+                    'unit_price' => $line->unit_price,
+                    'quantity' => $part['quantity'],
+                    'line_total' => $line->unit_price * $part['quantity'],
+                ]);
+            }
+
+            $line->delete();
+        }
+
+        $order->update([
+            'status' => Order::STATUS_CONFIRMED,
+            'confirmed_at' => now(),
+            'issue_note' => null,
+        ]);
     }
 
     private function moveToShipping(Order $order): void
     {
-        if (! in_array($order->status, [Order::STATUS_PENDING, Order::STATUS_PAID], true)) {
-            throw new DomainException('Chỉ đơn chưa giao mới chuyển sang đang giao.');
+        if ($order->status !== Order::STATUS_CONFIRMED) {
+            throw new DomainException('Chỉ đơn đã xác nhận (đã trừ kho) mới chuyển sang đang giao.');
         }
 
         $order->update(['status' => Order::STATUS_SHIPPING]);
