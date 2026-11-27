@@ -35,4 +35,14 @@ return [
         ],
     ],
 
+    // Distance from the farm to the customer for the shipping fee (Tuần 6).
+    // With a Google key the Distance Matrix API gives the driving distance; without one, the address is
+    // geocoded with OpenStreetMap Nominatim and the straight-line distance is multiplied by road_factor.
+    'maps' => [
+        'google_key' => env('GOOGLE_MAPS_API_KEY'),
+        'nominatim_url' => env('NOMINATIM_URL', 'https://nominatim.openstreetmap.org/search'),
+        'road_factor' => (float) env('SHIPPING_ROAD_FACTOR', 1.3),
+        'timeout' => 5,
+    ],
+
 ];
