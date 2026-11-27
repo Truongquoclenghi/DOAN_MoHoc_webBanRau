@@ -12,6 +12,7 @@ class FarmLog extends Model
     protected $fillable = [
         'farm_plot_id',
         'product_id',
+        'product_batch_id',
         'type',
         'description',
         'logged_on',
@@ -33,5 +34,16 @@ class FarmLog extends Model
     public function product(): BelongsTo
     {
         return $this->belongsTo(Product::class);
+    }
+
+    public function batch(): BelongsTo
+    {
+        return $this->belongsTo(ProductBatch::class, 'product_batch_id');
+    }
+
+    /** The farm staff member who wrote the entry. */
+    public function author(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'created_by');
     }
 }

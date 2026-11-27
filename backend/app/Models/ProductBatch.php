@@ -2,13 +2,18 @@
 
 namespace App\Models;
 
+use Database\Factories\ProductBatchFactory;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class ProductBatch extends Model
 {
+    /** @use HasFactory<ProductBatchFactory> */
+    use HasFactory;
+
     public const STATUS_AVAILABLE = 'available';
     public const STATUS_DEPLETED = 'depleted';
     public const STATUS_EXPIRED = 'expired';
@@ -21,6 +26,7 @@ class ProductBatch extends Model
         'trace_code',
         'quantity_received',
         'quantity_on_hand',
+        'quantity_wasted',
         'harvested_on',
         'expires_on',
         'status',
@@ -33,12 +39,19 @@ class ProductBatch extends Model
             'expires_on' => 'date',
             'quantity_received' => 'integer',
             'quantity_on_hand' => 'integer',
+            'quantity_wasted' => 'integer',
         ];
     }
 
     public function product(): BelongsTo
     {
         return $this->belongsTo(Product::class);
+    }
+
+    /** Farming diary entries written for this batch. */
+    public function logs(): HasMany
+    {
+        return $this->hasMany(FarmLog::class, "product_batch_id");
     }
 
     public function farmPlot(): BelongsTo
@@ -56,7 +69,8 @@ class ProductBatch extends Model
     {
         return $query->where('status', self::STATUS_AVAILABLE)
             ->where('quantity_on_hand', '>', 0)
-            ->whereDate('expires_on', '>=', now()->toDateString());
+            // Assignment rule: only batches expiring AFTER today can be sold.
+            ->whereDate('expires_on', '>', now()->toDateString());
     }
 
     /** Batches whose expiry falls within the next N days (for alerts / flash sale). */
