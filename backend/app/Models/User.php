@@ -15,7 +15,13 @@ class User extends Authenticatable
     use HasApiTokens, HasFactory, Notifiable;
 
     public const ROLE_CUSTOMER = 'customer';
+    // Farm staff: crops, diary, batches, QR codes, waste. Never sees orders or customers.
+    public const ROLE_STAFF = 'staff';
+    // Sales / customer care: orders, shipping, complaints. Never changes stock or batches.
+    public const ROLE_SALES = 'sales';
     public const ROLE_ADMIN = 'admin';
+
+    public const ROLES = [self::ROLE_CUSTOMER, self::ROLE_STAFF, self::ROLE_SALES, self::ROLE_ADMIN];
 
     protected $fillable = [
         'name',
@@ -26,6 +32,12 @@ class User extends Authenticatable
         'role',
         'points_balance',
         'is_active',
+    ];
+
+    // Match the column defaults, so a freshly created model already knows them.
+    protected $attributes = [
+        'role' => self::ROLE_CUSTOMER,
+        'is_active' => true,
     ];
 
     protected $hidden = [
@@ -46,6 +58,22 @@ class User extends Authenticatable
     public function isAdmin(): bool
     {
         return $this->role === self::ROLE_ADMIN;
+    }
+
+    /** Admins pass every role check; everyone else must hold one of the given roles. */
+    public function hasRole(string ...$roles): bool
+    {
+        return $this->isAdmin() || in_array($this->role, $roles, true);
+    }
+
+    public function isEmployee(): bool
+    {
+        return $this->role !== self::ROLE_CUSTOMER;
+    }
+
+    public function reviews(): HasMany
+    {
+        return $this->hasMany(Review::class);
     }
 
     public function cartItems(): HasMany

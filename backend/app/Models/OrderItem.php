@@ -10,6 +10,8 @@ class OrderItem extends Model
     protected $fillable = [
         'order_id',
         'product_id',
+        'product_batch_id',
+        'batch_code',
         'product_name',
         'unit_price',
         'quantity',
@@ -33,5 +35,11 @@ class OrderItem extends Model
     public function product(): BelongsTo
     {
         return $this->belongsTo(Product::class);
+    }
+
+    /** The batch (lô) the goods were taken from, set when the order is confirmed (FEFO). */
+    public function batch(): BelongsTo
+    {
+        return $this->belongsTo(ProductBatch::class, 'product_batch_id');
     }
 }
