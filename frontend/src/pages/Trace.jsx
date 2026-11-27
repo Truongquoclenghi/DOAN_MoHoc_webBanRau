@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import { QRCodeSVG } from 'qrcode.react';
-import { api, dateVN, FARM_TYPES } from '../api.js';
-import { Badge, Empty, Loading, Notice } from '../ui.jsx';
+import { api, dateVN } from '../api.js';
+import { Badge, Loading, Notice } from '../ui.jsx';
+import { Timeline } from './Shop.jsx';
 
 /** Public traceability page opened by scanning a batch's QR code. */
 export function TracePage() {
@@ -12,54 +13,39 @@ export function TracePage() {
 
   useEffect(() => {
     setData(null);
-    api(`/trace/${encodeURIComponent(code)}`)
-      .then(setData)
-      .catch((e) => setError(e.message));
+    setError('');
+    api(`/trace/${encodeURIComponent(code)}`).then(setData).catch((e) => setError(e.message));
   }, [code]);
 
-  if (error) return <Notice kind="error">Không tìm thấy lô hàng với mã này. ({error})</Notice>;
+  if (error) return <Notice kind="error">Không tìm thấy lô hàng với mã &quot;{code}&quot;. Kiểm tra lại mã trên bao bì.</Notice>;
   if (!data) return <Loading />;
 
   return (
     <section className="trace">
       <div className="card">
-        <h1>Truy xuất nguồn gốc</h1>
-        <h2>{data.product.name}</h2>
+        <p className="eyebrow dark">Truy xuất nguồn gốc · {data.farm?.name}</p>
+        <h1>{data.product.name}</h1>
         <dl className="facts">
           <dt>Mã lô</dt><dd>{data.batch_code}</dd>
           <dt>Mã truy xuất</dt><dd>{data.trace_code}</dd>
-          <dt>Nông trại</dt><dd>{data.farm_plot?.name ?? '—'}{data.farm_plot?.location ? ` · ${data.farm_plot.location}` : ''}</dd>
-          <dt>Chứng nhận</dt><dd>{data.farm_plot?.certification ?? 'Đang cập nhật'}</dd>
+          <dt>Khu canh tác</dt><dd>{data.farm_plot?.name ?? '—'}{data.farm_plot?.location ? ` · ${data.farm_plot.location}` : ''}</dd>
+          <dt>Chứng nhận</dt><dd>{data.farm_plot?.certification ?? data.farm?.certifications?.join(', ') ?? 'Đang cập nhật'}</dd>
           <dt>Ngày thu hoạch</dt><dd>{dateVN(data.harvested_on)}</dd>
           <dt>Hạn sử dụng</dt>
-          <dd>
-            {dateVN(data.expires_on)}{' '}
-            {data.is_expired ? <Badge tone="red">Đã hết hạn</Badge> : <Badge tone="green">Còn hạn</Badge>}
-          </dd>
+          <dd>{dateVN(data.expires_on)} {data.is_expired ? <Badge tone="red">Đã hết hạn</Badge> : <Badge tone="green">Còn hạn</Badge>}</dd>
+          <dt>Sản lượng lô</dt><dd>{data.quantity_received} {data.product.unit}</dd>
+          <dt>Địa chỉ nông trại</dt><dd>{data.farm?.address}</dd>
         </dl>
+        <Link to={`/products/${data.product.slug}`}>Xem sản phẩm và đặt mua</Link>
       </div>
 
       <div className="card qr">
-        <QRCodeSVG value={window.location.href} size={160} />
-        <p className="muted small">Quét mã để xem lại thông tin này</p>
+        <QRCodeSVG value={window.location.href} size={180} level="M" includeMargin />
+        <p className="muted small">Mã QR của lô {data.batch_code}</p>
       </div>
 
-      <h2>Nhật ký canh tác</h2>
-      {data.logs.length === 0 ? (
-        <Empty>Chưa có nhật ký canh tác cho lô đất này.</Empty>
-      ) : (
-        <ol className="timeline">
-          {data.logs.map((l) => (
-            <li key={l.id}>
-              <div><strong>{dateVN(l.logged_on)}</strong> · {FARM_TYPES[l.type] ?? l.type}</div>
-              <p>{l.description}</p>
-              {l.media_url && (l.media_type === 'video'
-                ? <video src={l.media_url} controls width="320" />
-                : <img className="log-media" src={l.media_url} alt="" />)}
-            </li>
-          ))}
-        </ol>
-      )}
+      <h2>Nhật ký canh tác của lô hàng</h2>
+      <Timeline logs={data.logs} />
     </section>
   );
 }
