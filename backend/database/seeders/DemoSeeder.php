@@ -18,6 +18,8 @@ use Illuminate\Support\Str;
  * expiry dates (for FEFO and expiry alerts), subscription plans and diary entries.
  *
  *   admin@farm.local / password   (quản trị)
+ *   staff@farm.local / password   (nhân viên nông trại: lô hàng, nhật ký, QR, xuất hủy)
+ *   sales@farm.local / password   (nhân viên bán hàng / CSKH: đơn hàng, khiếu nại)
  *   khach@farm.local / password   (khách hàng)
  */
 class DemoSeeder extends Seeder
@@ -29,6 +31,20 @@ class DemoSeeder extends Seeder
             'password' => 'password',
             'role' => User::ROLE_ADMIN,
             'phone' => '0900000001',
+        ]);
+
+        $staff = User::updateOrCreate(['email' => 'staff@farm.local'], [
+            'name' => 'Anh Ba (nhân viên vườn)',
+            'password' => 'password',
+            'role' => User::ROLE_STAFF,
+            'phone' => '0900000003',
+        ]);
+
+        User::updateOrCreate(['email' => 'sales@farm.local'], [
+            'name' => 'Chị Lan (bán hàng)',
+            'password' => 'password',
+            'role' => User::ROLE_SALES,
+            'phone' => '0900000004',
         ]);
 
         User::updateOrCreate(['email' => 'khach@farm.local'], [
@@ -44,17 +60,18 @@ class DemoSeeder extends Seeder
         $fruits = Category::firstOrCreate(['slug' => 'trai-cay'], ['name' => 'Trái cây']);
         $fresh = Category::firstOrCreate(['slug' => 'thuc-pham-tuoi'], ['name' => 'Thực phẩm tươi']);
 
-        $plotVeg = FarmPlot::firstOrCreate(['code' => 'LD-01'], [
-            'name' => 'Lô A - Rau ôn đới',
-            'location' => 'Đức Trọng, Lâm Đồng',
+        // The farm's own growing areas (one farm, several plots).
+        $plotVeg = FarmPlot::updateOrCreate(['code' => 'LD-01'], [
+            'name' => 'Khu A - Nhà kính rau ôn đới',
+            'location' => 'Xuân Thọ, Đà Lạt',
             'area_m2' => 2500,
             'certification' => 'VietGAP',
             'description' => 'Trồng rau trong nhà màng, tưới nhỏ giọt, không dùng thuốc trừ sâu hóa học trong 21 ngày trước thu hoạch.',
         ]);
 
-        $plotFruit = FarmPlot::firstOrCreate(['code' => 'LD-02'], [
-            'name' => 'Lô B - Vườn cây ăn trái',
-            'location' => 'Bảo Lộc, Lâm Đồng',
+        $plotFruit = FarmPlot::updateOrCreate(['code' => 'LD-02'], [
+            'name' => 'Khu B - Vườn cây ăn trái',
+            'location' => 'Xuân Thọ, Đà Lạt',
             'area_m2' => 5000,
             'certification' => 'Hữu cơ',
             'description' => 'Vườn trái cây canh tác hữu cơ, ủ phân từ phụ phẩm trong trang trại.',
@@ -72,6 +89,7 @@ class DemoSeeder extends Seeder
 
         $inventory = app(InventoryService::class);
         $products = [];
+        $firstBatch = [];
 
         foreach ($catalog as [$name, $category, $price, $unit, $plot, $batches]) {
             $product = Product::firstOrCreate(['slug' => Str::slug($name)], [
@@ -85,13 +103,14 @@ class DemoSeeder extends Seeder
             $products[$name] = $product;
 
             foreach ($batches as [$quantity, $daysToExpiry]) {
-                $inventory->receive([
+                $batch = $inventory->receive([
                     'product_id' => $product->id,
                     'farm_plot_id' => $plot->id,
                     'quantity_received' => $quantity,
                     'harvested_on' => now()->subDays(2)->toDateString(),
                     'expires_on' => now()->addDays($daysToExpiry)->toDateString(),
-                ], $admin->id);
+                ], $staff->id);
+                $firstBatch[$name] ??= $batch;
             }
         }
 
@@ -100,21 +119,22 @@ class DemoSeeder extends Seeder
 
         FarmLog::firstOrCreate(['farm_plot_id' => $plotVeg->id, 'type' => 'planting', 'logged_on' => now()->subDays(30)->toDateString()], [
             'description' => 'Gieo hạt xà lách và cà chua bi trên giàn thủy canh, mật độ 25 cây/m².',
-            'created_by' => $admin->id,
+            'created_by' => $staff->id,
         ]);
         FarmLog::firstOrCreate(['farm_plot_id' => $plotVeg->id, 'type' => 'fertilizing', 'logged_on' => now()->subDays(14)->toDateString()], [
             'description' => 'Bón phân hữu cơ ủ từ phân trùn quế, tưới dinh dưỡng EC 1.8.',
-            'created_by' => $admin->id,
+            'created_by' => $staff->id,
         ]);
         FarmLog::firstOrCreate(['farm_plot_id' => $plotVeg->id, 'type' => 'pest_control', 'logged_on' => now()->subDays(7)->toDateString()], [
             'description' => 'Phòng bệnh bằng chế phẩm sinh học, bẫy dính vàng theo dõi rệp.',
-            'created_by' => $admin->id,
+            'created_by' => $staff->id,
             'product_id' => $products['Cà chua bi']->id,
         ]);
         FarmLog::firstOrCreate(['farm_plot_id' => $plotVeg->id, 'type' => 'harvesting', 'logged_on' => now()->subDays(2)->toDateString()], [
             'description' => 'Thu hoạch buổi sáng khi nhiệt độ thấp, làm mát ngay sau khi hái.',
-            'created_by' => $admin->id,
+            'created_by' => $staff->id,
             'product_id' => $products['Xà lách lô lô']->id,
+            'product_batch_id' => $firstBatch['Xà lách lô lô']->id,
         ]);
 
         $vegPlan = SubscriptionPlan::firstOrCreate(['name' => 'Gói rau sạch hàng tuần'], [
