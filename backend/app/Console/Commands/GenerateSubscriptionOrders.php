@@ -10,13 +10,13 @@ class GenerateSubscriptionOrders extends Command
 {
     protected $signature = 'subscriptions:generate-orders';
 
-    protected $description = 'Create orders for subscription packages whose weekly order day has arrived';
+    protected $description = 'Queue one job per subscription delivery due tomorrow (each job creates and confirms the order)';
 
     public function handle(SubscriptionService $subscriptions): int
     {
-        $result = $subscriptions->generateDueOrders(CarbonImmutable::today());
+        $result = $subscriptions->dispatchDueDeliveries(CarbonImmutable::today());
 
-        $this->info("Created {$result['created']} order(s); {$result['failed']} skipped (see log).");
+        $this->info("Queued {$result['dispatched']} delivery job(s); {$result['skipped']} skipped (paused packages).");
 
         return self::SUCCESS;
     }
