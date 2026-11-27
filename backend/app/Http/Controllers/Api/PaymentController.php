@@ -4,19 +4,27 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Order;
+use App\Models\Subscription;
 use App\Services\OrderService;
 use App\Services\Payments\VnpayGateway;
+use App\Services\SubscriptionService;
 use DomainException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 
+/**
+ * Online payments for orders and for subscription prepayments.
+ * A payment reference is an order code (FN...) or SUB{id} for a subscription.
+ * When an order is paid its stock is taken immediately with FEFO (OrderService::markPaid).
+ */
 class PaymentController extends Controller
 {
     public function __construct(
         private VnpayGateway $vnpay,
         private OrderService $orders,
+        private SubscriptionService $subscriptions,
     ) {}
 
     /** Browser is redirected here by VNPay after the customer pays. */
@@ -24,20 +32,21 @@ class PaymentController extends Controller
     {
         $front = rtrim(config('payments.frontend_url'), '/');
         $input = $request->query();
-        $code = (string) ($input['vnp_TxnRef'] ?? '');
-        $order = Order::where('code', $code)->first();
+        $payable = $this->find((string) ($input['vnp_TxnRef'] ?? ''));
 
-        if (! $order || ! $this->vnpay->verifySignature($input)) {
+        if (! $payable || ! $this->vnpay->verifySignature($input)) {
             return redirect($front.'/orders?payment=invalid');
         }
 
-        if ($this->vnpay->isSuccessful($input)) {
-            $this->orders->markPaid($order, $input['vnp_TransactionNo'] ?? null);
+        $page = $payable instanceof Subscription ? $front.'/subscriptions' : $front.'/orders/'.$payable->code;
 
-            return redirect($front.'/orders/'.$code.'?payment=success');
+        if ($this->vnpay->isSuccessful($input)) {
+            $this->settle($payable, $input['vnp_TransactionNo'] ?? null);
+
+            return redirect($page.'?payment=success');
         }
 
-        return redirect($front.'/orders/'.$code.'?payment=failed');
+        return redirect($page.'?payment=failed');
     }
 
     /** Server-to-server notification from VNPay (IPN). Must answer with RspCode. */
@@ -49,23 +58,23 @@ class PaymentController extends Controller
             return response()->json(['RspCode' => '97', 'Message' => 'Invalid signature']);
         }
 
-        $order = Order::where('code', (string) ($input['vnp_TxnRef'] ?? ''))->first();
-        if (! $order) {
+        $payable = $this->find((string) ($input['vnp_TxnRef'] ?? ''));
+        if (! $payable) {
             return response()->json(['RspCode' => '01', 'Message' => 'Order not found']);
         }
 
-        if ((int) ($input['vnp_Amount'] ?? 0) !== $order->total * 100) {
+        if ((int) ($input['vnp_Amount'] ?? 0) !== $this->amountOf($payable) * 100) {
             return response()->json(['RspCode' => '04', 'Message' => 'Invalid amount']);
         }
 
-        if ($order->paid_at !== null) {
+        if ($payable->paid_at !== null) {
             return response()->json(['RspCode' => '02', 'Message' => 'Order already confirmed']);
         }
 
         if ($this->vnpay->isSuccessful($input)) {
-            $this->orders->markPaid($order, $input['vnp_TransactionNo'] ?? null);
+            $this->settle($payable, $input['vnp_TransactionNo'] ?? null);
         } else {
-            $order->update(['payment_status' => 'failed']);
+            $payable->update(['payment_status' => 'failed']);
         }
 
         return response()->json(['RspCode' => '00', 'Message' => 'Confirm Success']);
@@ -79,14 +88,61 @@ class PaymentController extends Controller
     {
         abort_unless(config('payments.mock_enabled'), 404);
 
-        $order = $request->user()->orders()->where('code', $code)->firstOrFail();
+        $payable = $this->find($code);
+        abort_unless($payable && $payable->user_id === $request->user()->id, 404);
 
-        if ($order->status === Order::STATUS_CANCELLED) {
+        if ($payable instanceof Order && $payable->status === Order::STATUS_CANCELLED) {
             throw new DomainException('Đơn đã bị hủy.');
         }
+        if ($payable instanceof Subscription && $payable->status === Subscription::STATUS_CANCELLED) {
+            throw new DomainException('Gói đã bị hủy.');
+        }
 
-        $this->orders->markPaid($order, 'MOCK-'.Str::upper(Str::random(10)));
+        $this->settle($payable, 'MOCK-'.Str::upper(Str::random(10)));
 
-        return response()->json($order->refresh()->load('items'));
+        return response()->json(
+            $payable instanceof Order
+                ? ['type' => 'order', 'order' => $payable->refresh()->load('items')]
+                : ['type' => 'subscription', 'subscription' => $payable->refresh()->load('plan')]
+        );
+    }
+
+    /** Payment page data for the mock gateway: what is being paid and how much. */
+    public function mockShow(Request $request, string $code): JsonResponse
+    {
+        abort_unless(config('payments.mock_enabled'), 404);
+
+        $payable = $this->find($code);
+        abort_unless($payable && $payable->user_id === $request->user()->id, 404);
+
+        return response()->json([
+            'code' => $code,
+            'type' => $payable instanceof Order ? 'order' : 'subscription',
+            'amount' => $this->amountOf($payable),
+            'paid' => $payable->paid_at !== null,
+        ]);
+    }
+
+    private function find(string $code): Order|Subscription|null
+    {
+        if (preg_match('/^SUB(\d+)$/', $code, $m)) {
+            return Subscription::find((int) $m[1]);
+        }
+
+        return Order::where('code', $code)->first();
+    }
+
+    private function amountOf(Order|Subscription $payable): int
+    {
+        return $payable instanceof Order ? $payable->total : $payable->total_price;
+    }
+
+    private function settle(Order|Subscription $payable, ?string $reference): void
+    {
+        if ($payable instanceof Order) {
+            $this->orders->markPaid($payable, $reference);
+        } else {
+            $this->subscriptions->markPaid($payable, $reference);
+        }
     }
 }
